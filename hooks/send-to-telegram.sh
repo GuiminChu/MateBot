@@ -5,15 +5,31 @@
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-YOUR_BOT_TOKEN_HERE}"
 INPUT=$(cat)
 TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path')
+TRANSCRIPT_CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
 CHAT_ID_FILE=~/.claude/telegram_chat_id
 PENDING_FILE=~/.claude/telegram_pending
 
 # Only respond to Telegram-initiated messages
 [ ! -f "$PENDING_FILE" ] && exit 0
 
-PENDING_TIME=$(cat "$PENDING_FILE" 2>/dev/null)
+PENDING_DATA=$(cat "$PENDING_FILE" 2>/dev/null)
+PENDING_CWD=$(echo "$PENDING_DATA" | jq -r '.tmux_cwd // empty')
+
+# Check if cwd matches (only respond to tmux session messages)
+if [ -n "$PENDING_CWD" ] && [ -n "$TRANSCRIPT_CWD" ]; then
+    # Normalize paths for comparison
+    NORMALIZED_PENDING=$(realpath "$PENDING_CWD" 2>/dev/null || echo "$PENDING_CWD")
+    NORMALIZED_CURRENT=$(realpath "$TRANSCRIPT_CWD" 2>/dev/null || echo "$TRANSCRIPT_CWD")
+
+    # Only proceed if paths match
+    if [ "$NORMALIZED_PENDING" != "$NORMALIZED_CURRENT" ]; then
+        exit 0
+    fi
+fi
+
+PENDING_TIME=$(echo "$PENDING_DATA" | jq -r '.timestamp // empty')
 NOW=$(date +%s)
-[ -z "$PENDING_TIME" ] || [ $((NOW - PENDING_TIME)) -gt 600 ] && rm -f "$PENDING_FILE" && exit 0
+[ -n "$PENDING_TIME" ] && [ $((NOW - PENDING_TIME)) -gt 600 ] && rm -f "$PENDING_FILE" && exit 0
 [ ! -f "$CHAT_ID_FILE" ] || [ ! -f "$TRANSCRIPT_PATH" ] && rm -f "$PENDING_FILE" && exit 0
 
 CHAT_ID=$(cat "$CHAT_ID_FILE")
@@ -28,7 +44,7 @@ tail -n "+$LAST_USER_LINE" "$TRANSCRIPT_PATH" | \
 [ ! -s "$TMPFILE" ] && rm -f "$TMPFILE" "$PENDING_FILE" && exit 0
 
 python3 - "$TMPFILE" "$CHAT_ID" "$TELEGRAM_BOT_TOKEN" << 'PYEOF'
-import sys, re, json, urllib.request
+import sys, re, json, urllib.request, ssl
 
 tmpfile, chat_id, token = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(tmpfile) as f:
@@ -66,8 +82,11 @@ def send(txt, mode=None):
         data["parse_mode"] = mode
     try:
         req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", json.dumps(data).encode(), {"Content-Type": "application/json"})
-        return json.loads(urllib.request.urlopen(req, timeout=10).read()).get("ok")
-    except:
+        # 禁用 SSL 验证（因为某些网络环境有自签名证书）
+        context = ssl._create_unverified_context()
+        result = json.loads(urllib.request.urlopen(req, timeout=10, context=context).read())
+        return result.get("ok")
+    except Exception:
         return False
 
 if not send(text, "HTML"):

@@ -220,6 +220,21 @@ class TmuxManager:
         """Send Escape key to tmux."""
         subprocess.run(["tmux", "send-keys", "-t", Config.TMUX_SESSION, "Escape"])
 
+    @staticmethod
+    def get_cwd() -> Optional[str]:
+        """Get the current working directory of the tmux session."""
+        try:
+            result = subprocess.run(
+                ["tmux", "display-message", "-p", "-t", Config.TMUX_SESSION, "#{pane_current_path}"],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception as e:
+            print(f"Error getting tmux cwd: {e}")
+        return None
+
 
 def load_claude_md() -> str:
     """Load .CLAUDE.md from project or home directory."""
@@ -329,8 +344,12 @@ def get_session_id(project_path):
     return None
 
 
-def find_latest_transcript():
-    """Find the most recent Claude transcript file."""
+def find_latest_transcript(cwd: Optional[str] = None):
+    """Find the most recent Claude transcript file.
+
+    Args:
+        cwd: If specified, only look for transcripts in the project matching this directory.
+    """
     search_paths = [
         Path.home() / ".claude" / "transcripts",
         Path.home() / ".claude" / "projects",
@@ -344,6 +363,15 @@ def find_latest_transcript():
         if path.name == "projects":
             for project_dir in path.iterdir():
                 if project_dir.is_dir():
+                    # If cwd is specified, filter by matching project directory
+                    if cwd:
+                        # Convert cwd to the format used by Claude Code (replace / with -)
+                        # e.g., /Users/kev1n/Works/MyGit/MateBot -> -Users-kev1n-Works-MyGit-MateBot
+                        cwd_normalized = cwd.replace("/", "-").lstrip("-").lower()
+                        project_dir_name = project_dir.name.lower().replace("_", "-").replace(".", "-")
+                        # Check if project_dir matches cwd (fuzzy matching to handle different separators)
+                        if cwd_normalized not in project_dir_name and project_dir_name not in cwd_normalized:
+                            continue
                     all_transcripts.extend(project_dir.glob("*.jsonl"))
         else:
             all_transcripts.extend(path.glob("*.jsonl"))
@@ -523,8 +551,16 @@ class ResponseMonitor:
         self._checking = True
 
         try:
-            transcript_path = find_latest_transcript()
-            if not transcript_path:
+            # 读取 PENDING_FILE 获取指定的 transcript 路径
+            with open(Config.PENDING_FILE, "r") as f:
+                pending_data = json.load(f)
+
+            transcript_path_str = pending_data.get("transcript_path", "")
+            if not transcript_path_str:
+                return
+
+            transcript_path = Path(transcript_path_str)
+            if not transcript_path.exists():
                 return
 
             # 正确处理文件切换：当切换到新文件时重置位置
@@ -552,30 +588,19 @@ class ResponseMonitor:
             # Skip empty responses (e.g., when only XML observations were present)
             if not cleaned_responses or not cleaned_responses.strip():
                 print(f"Skipping empty response for chat {chat_id}")
-                # 空响应也清理pending文件，避免卡住
-                if os.path.exists(Config.PENDING_FILE):
-                    os.remove(Config.PENDING_FILE)
-                    print(f"[DEBUG] Pending file removed for empty response")
+                # 不删除 PENDING_FILE，等待实际的响应
                 return
 
-            # 先保存到内存，再发送消息
+            # 先保存到内存
             self._save_to_memory(chat_id, cleaned_responses, memory_update)
 
-            # 发送消息到Telegram
-            reply(chat_id, cleaned_responses)
-            print(f"[DEBUG] Response sent to chat {chat_id}")
-
-            # 只有在成功发送响应后才移除pending文件
-            if os.path.exists(Config.PENDING_FILE):
-                os.remove(Config.PENDING_FILE)
-                print(f"[DEBUG] Pending file removed after sending response")
+            # 注意：不再在这里发送响应，由 hook 脚本负责发送
+            # ResponseMonitor 只负责监听和清理 PENDING_FILE
+            print(f"[DEBUG] Response detected, leaving pending file for hook to process")
 
         except Exception as e:
-            print(f"Error sending response: {e}")
-            # 发生错误时也清理pending文件，避免无限等待
-            if os.path.exists(Config.PENDING_FILE):
-                os.remove(Config.PENDING_FILE)
-                print(f"[DEBUG] Pending file removed due to error")
+            print(f"Error in response monitor: {e}")
+            # 不删除 PENDING_FILE，让 hook 来处理
         finally:
             # 释放锁
             self._checking = False
@@ -708,9 +733,9 @@ class MessageQueue:
             # 确保目录存在
             Config.PENDING_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-            # 创建pending文件
+            # 先创建 pending 文件（只包含时间戳）
             with open(Config.PENDING_FILE, "w") as f:
-                f.write(str(int(time.time())))
+                json.dump({"timestamp": int(time.time())}, f)
 
             print(f"[DEBUG] Message queued and processing started for chat_id={chat_id}")
 
@@ -728,6 +753,25 @@ class MessageQueue:
             tmux_send(full_prompt)
             tmux_send_enter()
 
+            # 获取 tmux 会话的当前工作目录
+            tmux_cwd = TmuxManager.get_cwd()
+            print(f"[DEBUG] tmux cwd: {tmux_cwd}")
+
+            # 短暂等待，然后获取 tmux 会话的 transcript 路径
+            # 这样可以确保获取到的是 tmux 会话而不是 VS Code 的 transcript
+            time.sleep(0.5)
+            transcript_path = find_latest_transcript(cwd=tmux_cwd)
+
+            # 更新 PENDING_FILE，加入 tmux 会话的 transcript 路径和 cwd
+            pending_data = {
+                "timestamp": int(time.time()),
+                "transcript_path": str(transcript_path) if transcript_path else "",
+                "tmux_cwd": tmux_cwd or ""
+            }
+            with open(Config.PENDING_FILE, "w") as f:
+                json.dump(pending_data, f)
+            print(f"[DEBUG] Updated PENDING_FILE with transcript: {transcript_path}")
+
             # 等待Claude生成响应
             print(f"[DEBUG] Waiting for Claude response...")
             # 等待响应生成
@@ -736,7 +780,7 @@ class MessageQueue:
             check_count = 0
 
             while time.time() - start_time < timeout:
-                transcript_path = find_latest_transcript()
+                transcript_path = find_latest_transcript(cwd=tmux_cwd)
                 if transcript_path and transcript_path.exists():
                     responses, _ = extract_assistant_responses(transcript_path, response_monitor.last_position)
                     if responses and responses.strip():
@@ -790,8 +834,15 @@ class BotHandler:
 
     def _start_typing(self, chat_id):
         """Start typing indicator."""
+        tmux_cwd = TmuxManager.get_cwd()
+        transcript_path = find_latest_transcript(cwd=tmux_cwd)
+        pending_data = {
+            "timestamp": int(time.time()),
+            "transcript_path": str(transcript_path) if transcript_path else "",
+            "tmux_cwd": tmux_cwd or ""
+        }
         with open(Config.PENDING_FILE, "w") as f:
-            f.write(str(int(time.time())))
+            json.dump(pending_data, f)
         threading.Thread(target=send_typing_loop, args=(chat_id,), daemon=True).start()
 
     def _get_or_init_auto_memory_instruction(self) -> str:

@@ -87,8 +87,11 @@ start_tmux_claude() {
 
     if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
         print_success "tmux 会话 '$TMUX_SESSION' 已存在"
+        # 确保工作目录正确
+        tmux send-keys -t "$TMUX_SESSION" "cd $PROJECT_DIR" C-m
     else
-        tmux new-session -d -s "$TMUX_SESSION"
+        # 创建新会话并切换到项目目录
+        tmux new-session -d -s "$TMUX_SESSION" -c "$PROJECT_DIR"
         sleep 1
         tmux send-keys -t "$TMUX_SESSION" "claude --dangerously-skip-permissions" C-m
         sleep 2
