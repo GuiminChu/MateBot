@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import ssl
 import threading
 import time
 import urllib.request
@@ -155,7 +156,9 @@ class TelegramAPI:
             headers={"Content-Type": "application/json"}
         )
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            # Create SSL context that bypasses certificate verification
+            ssl_context = ssl._create_unverified_context()
+            with urllib.request.urlopen(req, timeout=30, context=ssl_context) as r:
                 return json.loads(r.read())
         except Exception as e:
             print(f"Telegram API error: {e}")
